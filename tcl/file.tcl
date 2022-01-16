@@ -54,8 +54,9 @@ proc ::file::Exit {}  {
 #
 proc ::file::New {} {
   set ftype {
-    { "Scid databases" {".si4"} }
+    { "Scid5 databases" {".si5"} }
     { "PGN files" {".pgn" ".PGN"} }
+    { "Scid4 databases" {".si4"} }
   }
   
   set fName [tk_getSaveFile \
@@ -66,12 +67,14 @@ proc ::file::New {} {
   
   if {$fName == ""} { return }
   set file_extension [string tolower [file extension $fName]]
-  if {$file_extension == ".si4"} {
-    set dbType "SCID4"
+  set dbName $fName
+  if {$file_extension == ".si5"} {
+    set dbType "SCID5"
     set dbName [file rootname $fName]
+  } elseif {$file_extension == ".si4"} {
+    set dbType "SCID4"
   } elseif {$file_extension == ".pgn"} {
     set dbType "PGN"
-    set dbName $fName
   }
   if {[catch {sc_base create $dbType $dbName} baseId]} {
     ERROR::MessageBox "$fName\n"
@@ -123,9 +126,8 @@ proc ::file::openBaseAsTree { { fName "" } } {
 proc ::file::Open_ {{fName ""} } {
   if {$fName == ""} {
       set ftype {
-        { "All Scid files" {".si4" ".si3" ".pgn" ".epd"} }
-        { "Scid databases, PGN files" {".si4" ".si3" ".pgn" ".PGN"} }
-        { "Scid databases" {".si4" ".si3"} }
+        { "All Scid files" {".si5" ".si4" ".si3" ".pgn" ".epd"} }
+        { "Scid databases" {".si5" ".si4" ".si3"} }
         { "PGN files" {".pgn" ".PGN"} }
         { "EPD files" {".epd" ".EPD"} }
       }
@@ -135,8 +137,9 @@ proc ::file::Open_ {{fName ""} } {
   }
 
   set ext [string tolower [file extension "$fName"] ]
-  if {"$ext" == ".si4"} { set fName [file rootname "$fName"] }
-  if {[sc_base slot $fName] != 0} {
+  set dbName $fName
+  if {$ext == ".si5"} { set dbName [file rootname "$fName"] }
+  if {[sc_base slot $dbName] != 0} {
     tk_messageBox -title "Scid: opening file" -message "The database you selected is already opened."
     return 1
   }
@@ -167,20 +170,25 @@ proc ::file::Open_ {{fName ""} } {
       set ::initialDir(base) [file dirname "$fName"]
       ::recentFiles::add "$fName"
     }
-  } elseif {"$ext" eq ".si4" || "$ext" eq ""} {
+  } else {
+    if {$ext == ".si5"} {
+      set dbType "SCID5"
+    } elseif {$ext == ".si4" || $ext eq ""} {
+      set dbType "SCID4"
+    } else {
+      tk_messageBox -title "Scid: opening file" -message "Unsupported database format:  $ext"
+      return 1;
+    }
     progressWindow "Scid" "$::tr(OpeningTheDatabase): [file tail "$fName"]..." $::tr(Cancel)
-    set err [catch {sc_base open "$fName"} ::file::lastOpened]
+    set err [catch {sc_base open $dbType $dbName} ::file::lastOpened]
     closeProgressWindow
     if {$err} {
       if { $::errorCode == $::ERROR::NameDataLoss } { set err 0 }
-      ERROR::MessageBox "$fName.si4\n"
+      ERROR::MessageBox "$fName\n"
     } else {
       set ::initialDir(base) [file dirname "$fName"]
-      ::recentFiles::add "$fName.si4"
+      ::recentFiles::add "$fName"
     }
-  } else {
-    tk_messageBox -title "Scid: opening file" -message "Unsupported database format:  $ext"
-    set err 1
   }
   
   return $err
