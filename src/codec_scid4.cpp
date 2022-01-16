@@ -531,16 +531,22 @@ errorT CodecSCID4::dyn_open(fileModeT fMode, const char* filename,
                             NameBase* nb) {
 	if (fMode == FMODE_WriteOnly || !filename || !idx || !nb)
 		return ERROR;
-	if (*filename == '\0')
+
+	std::string dbname = filename;
+	if (dbname.size() >= 4 && dbname.substr(dbname.size() - 4) == ".si4")
+		dbname.erase(dbname.size() - 4);
+
+	if (dbname.empty())
 		return ERROR_FileOpen;
 
 	idx_ = idx;
 	idx_->Init();
 	nb_ = nb;
+
 	filenames_.resize(3);
-	filenames_[0] = std::string(filename) + ".si4";
-	filenames_[1] = std::string(filename) + ".sn4";
-	filenames_[2] = std::string(filename) + ".sg4";
+	filenames_[0] = dbname + ".si4";
+	filenames_[1] = dbname + ".sn4";
+	filenames_[2] = dbname + ".sg4";
 
 	errorT err = gfile_.open(filenames_[2], fMode);
 	if (err != OK)
