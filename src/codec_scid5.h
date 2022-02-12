@@ -28,67 +28,96 @@
 #include "namebase.h"
 #include <filesystem>
 #include <future>
+#include <rocksdb/db.h>
+#include <rocksdb/filter_policy.h>
+#include <rocksdb/options.h>
+#include <rocksdb/slice.h>
+#include <rocksdb/slice_transform.h>
+#include <rocksdb/utilities/options_util.h>
 
 // This class manages databases encoded in SCID format v5.
 class CodecSCID5 : public ICodecDatabase {
 	Index* idx_ = nullptr;
 	NameBase* nb_ = nullptr;
-	std::vector<std::string> filenames_;
+	std::string buf_;
 	Filebuf idxfile_;
-	FilebufAppend gfile_;
-	Filebuf nbfile_;
+	rocksdb::DB* db_ = nullptr;
+	std::vector<rocksdb::ColumnFamilyHandle*> handles;
+	rocksdb::PinnableSlice slice_;
+	rocksdb::WriteOptions writeopt_;
 	gamenumT seqWrite_ = 0;
-	char gamecache_[1ULL << 17];
 
 	enum : uint64_t {
-		LIMIT_GAMEOFFSET = 1ULL << 47,
-		LIMIT_GAMELEN = 1ULL << 17,
 		LIMIT_NUMGAMES = (1ULL << 32) - 2,
 		LIMIT_UNIQUENAMES = 1ULL << 28,
 		LIMIT_NAMELEN = 255
 	};
 
-	enum { INDEX_ENTRY_SIZE = 56 };
+	enum { INDEX_ENTRY_SIZE = 48 };
+
+public:
+	~CodecSCID5() {
+		for (auto handle : handles) {
+			delete handle;
+		}
+		delete db_;
+	}
 
 public: // ICodecDatabase interface
-	Codec getType() const final { return ICodecDatabase::SCID5; }
+	Codec getType() const override { return ICodecDatabase::SCID5; }
 
-	// Returns the full path of the three files (index, namebase and gamefile)
-	// used by the database.
-	std::vector<std::string> getFilenames() const final { return filenames_; };
+	std::vector<std::string> getFilenames() const override {
+		return std::vector<std::string>();
+	}
 
 	std::vector<std::pair<const char*, std::string>>
-	getExtraInfo() const final {
+	getExtraInfo() const override {
 		std::vector<std::pair<const char*, std::string>> res;
+		auto it = db_->NewIterator({}, handles[0]);
+		for (it->SeekToFirst(); it->Valid(); it->Next()) {
+			// TODO: change to std::vector<string, string>
+			// res.emplace_back(it->key(), it->value());
+		}
+		delete it;
 		return res;
 	}
 
-	errorT setExtraInfo(const char*, const char*) final { return OK; };
+	errorT setExtraInfo(const char* tagname, const char* new_value) override {
+		if (!db_->Put(writeopt_, handles[0], tagname, new_value).ok())
+			return ERROR_FileWrite;
+
+		return OK;
+	}
 
 	ByteBuffer getGameData(uint64_t offset, uint32_t length) final {
-		if (offset >= gfile_.size())
-			return {nullptr, 0};
-		if (length >= LIMIT_GAMELEN)
+		char key[4];
+		encode_uint32_bigendian(key, offset);
+
+		if (!db_->Get({}, handles[3], {key, 4}, &buf_).ok())
 			return {nullptr, 0};
 
-		if (gfile_.pubseekpos(offset) == -1)
-			return {nullptr, 0};
-		if (gfile_.sgetn(gamecache_, length) != std::streamsize(length))
+		if (!db_->Get({}, handles[2], {key, 4}, &slice_).ok())
 			return {nullptr, 0};
 
-		return {reinterpret_cast<const byte*>(gamecache_), length};
+		auto tags = ByteBuffer((unsigned char*)buf_.data(), buf_.size());
+		if (OK != tags.decodeTags([](auto, auto) {}))
+			return {nullptr, 0};
+
+		buf_.insert(buf_.size() - tags.size(), slice_.data(), slice_.size());
+		return {(unsigned char*)buf_.data(), buf_.size()};
 	}
 
 	ByteBuffer getGameMoves(IndexEntry const& ie) final {
-		auto data = getGameData(ie.GetOffset(), ie.GetLength());
-		if (data && OK == data.decodeTags([](auto, auto) {}))
-			return data;
+		char key[4];
+		encode_uint32_bigendian(key, ie.GetOffset());
+		if (!db_->Get({}, handles[2], {key, 4}, &slice_).ok())
+			return {nullptr, 0};
 
-		return {nullptr, 0};
+		return {(unsigned char*)slice_.data(), slice_.size()};
 	}
 
 	errorT addGame(IndexEntry const& ie_src, TagRoster const& tags,
-	               ByteBuffer const& data) final {
+	               ByteBuffer const& data) override {
 		const auto nGames = idx_->GetNumGames();
 		if (nGames >= LIMIT_NUMGAMES)
 			return ERROR_NumGamesLimit;
@@ -102,7 +131,7 @@ public: // ICodecDatabase interface
 	}
 
 	errorT saveGame(IndexEntry const& ie_src, TagRoster const& tags,
-	                ByteBuffer const& data, gamenumT replaced) final {
+	                ByteBuffer const& data, gamenumT replaced) override {
 		IndexEntry ie = ie_src;
 		if (auto err = addGameNamesAndData(ie, tags, data, replaced))
 			return err;
@@ -111,25 +140,23 @@ public: // ICodecDatabase interface
 		return writeIndexEntry(ie, replaced);
 	}
 
-	errorT saveIndexEntry(const IndexEntry& ie, gamenumT replaced) final {
+	errorT saveIndexEntry(const IndexEntry& ie, gamenumT replaced) override {
 		idx_->replaceEntry(ie, replaced);
 		return writeIndexEntry(ie, replaced);
 	}
 
-	std::pair<errorT, idNumberT> addName(nameT nt, const char* name) final {
+	std::pair<errorT, idNumberT> addName(nameT nt, const char* name) override {
 		return dyn_addName(nt, name);
 	}
 
-	errorT flush() final {
-		seqWrite_ = 0;
-		errorT errIndex = (idxfile_.pubsync() == 0) ? OK : ERROR_FileWrite;
-		errorT errGfile = (gfile_.pubsync() == 0) ? OK : ERROR_FileWrite;
-		errorT errNBfile = (gfile_.pubsync() == 0) ? OK : ERROR_FileWrite;
-		return errIndex ? errIndex : errGfile ? errGfile : errNBfile;
+	errorT flush() override {
+		db_->Flush({}, handles);
+		return OK;
 	}
 
 	errorT dyn_open(fileModeT fMode, const char* dbname,
-	                const Progress& progress, Index* idx, NameBase* nb) final {
+	                const Progress& progress, Index* idx,
+	                NameBase* nb) override {
 		if (fMode == FMODE_WriteOnly || !dbname || !idx || !nb)
 			return ERROR;
 		if (*dbname == '\0')
@@ -137,50 +164,159 @@ public: // ICodecDatabase interface
 
 		idx_ = idx;
 		nb_ = nb;
+		writeopt_.disableWAL = true;
 
-		filenames_.resize(3);
 		auto dbpath = std::filesystem::path(dbname);
-		filenames_[0] = dbpath.replace_extension("si5").string();
-		filenames_[1] = dbpath.replace_extension("sg5").string();
-		filenames_[2] = dbpath.replace_extension("sn5").string();
+		const auto index = dbpath.replace_extension("si5").string();
+		const auto dbname_rocks = dbpath.replace_extension("rocksdb").string();
 
 		if (fMode == FMODE_Create) {
-			for (auto const& fname : filenames_) {
-				std::error_code ec;
-				if (std::filesystem::exists(fname, ec) || ec)
-					return ERROR_Exists;
-			}
+			std::error_code ec;
+			if (std::filesystem::exists(index, ec) || ec)
+				return ERROR_Exists;
 
-			if (auto err = idxfile_.Open(filenames_[0].c_str(), fMode))
+			if (auto err = idxfile_.Open(index.c_str(), fMode))
 				return err;
 
-			if (auto err = gfile_.open(filenames_[1], fMode))
-				return err;
-
-			return nbfile_.Open(filenames_[2].c_str(), fMode);
+			return create_db(dbname_rocks);
 		}
 
-		auto read_names = std::async(std::launch::async,
-		                             &CodecSCID5::readNamebase, this, fMode,
-		                             filenames_[2]);
+		auto read_names = std::async(
+		    std::launch::async, &CodecSCID5::readNamebase, this, dbname_rocks);
 
-		if (auto err = gfile_.open(filenames_[1], fMode))
-			return err;
-
-		auto res = readIndex(fMode, filenames_[0].c_str(), progress);
+		auto res = readIndex(fMode, index.c_str(), progress);
 		auto err_names = read_names.get();
 		progress.report(1, 1);
 		return err_names ? err_names : res;
 	}
 
 private:
-	// Given a name (string), retrieve the corresponding ID.
-	// The name is added to @e nb_ if do not already exists in the NameBase.
-	// @param nt:   nameT type of the name to retrieve.
-	// @param name: the name to retrieve.
-	// @returns
-	// - on success, a @e std::pair containing OK and the ID.
-	// - on failure, a @e std::pair containing an error code and 0.
+	errorT create_db(std::string const& dbname) {
+		rocksdb::Options options;
+		options.IncreaseParallelism();
+		options.error_if_exists = true;
+		options.create_if_missing = true;
+		options.create_missing_column_families = true;
+
+		// Columns
+		// header:   read_seq, write_rnd, compress_none
+		// index:    read_seq, write_rnd, compress_lz4
+		// names:    read_seq, write_rnd, compress_lz4
+		// moves:    read_rnd, write_rnd, compress_lz4
+		// tags:     read_rnd, write_rnd, compress_zstd_dict
+		// comments: read_rnd, write_rnd, compress_zstd_dict
+		rocksdb::ColumnFamilyOptions read_seq;
+		read_seq.compression = rocksdb::kLZ4Compression;
+
+		rocksdb::ColumnFamilyOptions read_seq_nocache;
+		rocksdb::BlockBasedTableOptions opt_nocache;
+		opt_nocache.no_block_cache = true;
+		opt_nocache.block_size = 46 * 4 * 1024;
+		read_seq_nocache.compression = rocksdb::kLZ4Compression;
+		read_seq_nocache.table_factory.reset(
+		    rocksdb::NewBlockBasedTableFactory(opt_nocache));
+
+		rocksdb::ColumnFamilyOptions read_rnd;
+		read_rnd.OptimizeForPointLookup(128);
+		read_rnd.compression = rocksdb::kLZ4Compression;
+
+		rocksdb::ColumnFamilyOptions read_rnd_zstd;
+		read_rnd_zstd.compression = rocksdb::kZSTD;
+		read_rnd_zstd.compression_opts.max_dict_bytes = 16 * 1024;
+		read_rnd_zstd.compression_opts.zstd_max_train_bytes = 100 * 16 * 1024;
+
+		std::vector<rocksdb::ColumnFamilyDescriptor> cols;
+		cols.emplace_back();
+		cols.emplace_back("idx", read_seq_nocache);
+		cols.emplace_back("moves", read_rnd);
+		cols.emplace_back("tags_comments", read_rnd_zstd);
+		cols.emplace_back("player", read_seq);
+		cols.emplace_back("event", read_seq);
+		cols.emplace_back("site", read_seq);
+		cols.emplace_back("round", read_seq);
+		if (!rocksdb::DB::Open(options, dbname, cols, &handles, &db_).ok())
+			return ERROR_FileOpen;
+
+		if (auto err = setExtraInfo("type", "0"))
+			return err;
+		if (auto err = setExtraInfo("autoload", "1"))
+			return err;
+		if (auto err = setExtraInfo("description", ""))
+			return err;
+		if (auto err = setExtraInfo("flag1", ""))
+			return err;
+		if (auto err = setExtraInfo("flag2", ""))
+			return err;
+		if (auto err = setExtraInfo("flag3", ""))
+			return err;
+		if (auto err = setExtraInfo("flag4", ""))
+			return err;
+		if (auto err = setExtraInfo("flag5", ""))
+			return err;
+		if (auto err = setExtraInfo("flag6", ""))
+			return err;
+
+		return OK;
+	}
+
+	errorT readNamebase(std::string const& dbname) {
+		rocksdb::Options options;
+		std::vector<rocksdb::ColumnFamilyDescriptor> cols;
+		if (!rocksdb::LoadLatestOptions({}, dbname, &options, &cols).ok())
+			return ERROR_FileOpen;
+
+		options.error_if_exists = false;
+		options.create_if_missing = false;
+		options.create_missing_column_families = false;
+		if (!rocksdb::DB::Open(options, dbname, cols, &handles, &db_).ok())
+			return ERROR_FileOpen;
+
+		std::future<errorT> async[3];
+		async[0] = std::async(std::launch::async, &CodecSCID5::readTable, this,
+		                      NAME_PLAYER);
+		async[1] = std::async(std::launch::async, &CodecSCID5::readTable, this,
+		                      NAME_EVENT);
+		async[2] = std::async(std::launch::async, &CodecSCID5::readTable, this,
+		                      NAME_SITE);
+		auto res = readTable(NAME_ROUND);
+		for (auto& e : async) {
+			if (auto err = e.get())
+				res = err;
+		}
+		return res;
+	}
+
+	errorT readTable(char nt) {
+		auto it = std::unique_ptr<rocksdb::Iterator>(
+		    db_->NewIterator({}, handles[nt + 4]));
+		if (!it)
+			return ERROR_FileRead;
+
+		for (it->SeekToFirst(); it->Valid(); it->Next()) {
+			auto key = it->key();
+			auto value = it->value();
+			if (value.size() != 4)
+				return ERROR_Decode;
+
+			const auto id = decode_uint32(value.data());
+			if (!nb_->insert(key.data(), key.size(), nt, id))
+				return ERROR_Decode;
+		}
+		if (nb_->getNames()[nt].size() != nb_->GetNumNames(nt))
+			return ERROR_Decode;
+
+		return OK;
+	}
+
+	/**
+	 * Given a name (string), retrieve the corresponding ID.
+	 * The name is added to @e nb_ if do not already exists in the NameBase.
+	 * @param nt:   nameT type of the name to retrieve.
+	 * @param name: the name to retrieve.
+	 * @returns
+	 * - on success, a @e std::pair containing OK and the ID.
+	 * - on failure, a @e std::pair containing an error code and 0.
+	 */
 	std::pair<errorT, idNumberT> dyn_addName(nameT nt, const char* name) {
 		idNumberT id;
 		if (OK == nb_->FindExactName(nt, name, &id))
@@ -190,49 +326,56 @@ private:
 		if (res.first != OK)
 			return res;
 
-		// TODO: If writing fails the name must be removed from memory
-		const auto nameLen = strlen(name);
-		if (nameLen != nbfile_.sputc(static_cast<unsigned char>(nameLen)))
-			return {ERROR_FileWrite, id};
-
-		if (nt != nbfile_.sputc(nt))
-			return {ERROR_FileWrite, id};
-
-		if (nameLen != nbfile_.sputn(name, nameLen))
-			return {ERROR_FileWrite, id};
+		char value[4];
+		encode_uint32(value, res.second);
+		if (!db_->Put(writeopt_, handles[nt + 4], name, {value, 4}).ok())
+			res.first = ERROR_FileWrite;
 
 		return res;
 	}
 
-	/// Add the game's roster tags and gamedata to the database.
-	/// Set the references to the new data in @e ie.
 	errorT addGameNamesAndData(IndexEntry& ie, TagRoster const& tags,
 	                           ByteBuffer const& data, gamenumT replaced) {
-		const auto data_sz = data.size();
-		if (data_sz >= LIMIT_GAMELEN)
-			return ERROR_GameLengthLimit;
+		ie.SetOffset(replaced);
 
 		if (auto err = tags.map(
 		        ie, [&](auto nt, auto name) { return dyn_addName(nt, name); }))
 			return err;
 
-		// The SCID5 format stores games into blocks of 128KB.
-		// If the current block does not have enough space, we fill it with
-		// random data and use the next one.
-		const char* gdata = reinterpret_cast<const char*>(data.data());
-		uint64_t blockSpace = LIMIT_GAMELEN - (gfile_.size() % LIMIT_GAMELEN);
-		if (blockSpace < data_sz) {
-			if (auto err = gfile_.append(gdata, blockSpace))
-				return err;
+		auto split = data;
+		if (auto err = split.decodeTags([](auto, auto) {}))
+			return err;
+
+		const auto tag_sz = data.size() - split.size();
+
+		if (auto err = split.decodeStartBoard().first)
+			return err;
+
+		auto it = split.data();
+		auto end = it + split.size();
+		while (it != end) {
+			it = std::find(it, end, 15);
+			// Check it is really the end of the game and not a NAG
+			if (*(it - 1) != 11)
+				break;
 		}
+		const size_t moves_sz = std::distance(split.data(), it);
+		const auto cmnt_sz = data.size() - tag_sz - moves_sz;
 
-		uint64_t offset = gfile_.size();
-		if (offset >= LIMIT_GAMEOFFSET)
-			return ERROR_OffsetLimit;
+		char key[4];
+		encode_uint32_bigendian(key, replaced);
+		auto moves = reinterpret_cast<const char*>(data.data());
+		if (!db_->Put(writeopt_, handles[2], {key, 4},
+		              {moves + tag_sz, moves_sz})
+		         .ok())
+			return ERROR_FileWrite;
 
-		ie.SetOffset(offset);
-		ie.SetLength(data_sz);
-		return gfile_.append(gdata, data_sz);
+		auto buf = std::string(moves, tag_sz);
+		buf.append(moves + tag_sz + moves_sz, cmnt_sz);
+		if (!db_->Put(writeopt_, handles[3], {key, 4}, buf).ok())
+			return ERROR_FileWrite;
+
+		return OK;
 	}
 
 	errorT readIndex(fileModeT fMode, const char* indexFilename,
@@ -250,7 +393,7 @@ private:
 
 		for (gamenumT gNum = 0; idxfile_.sgetc() != EOF; ++gNum) {
 			if (gNum == nGames)
-				return ERROR_Corrupt;
+				return ERROR_CorruptData;
 
 			if ((gNum % 8192) == 0) {
 				if (!progress.report(gNum, nGames))
@@ -262,6 +405,7 @@ private:
 				return ERROR_FileRead;
 
 			idx_->entries_[gNum] = decodeIndexEntry(buf);
+			idx_->entries_[gNum].SetOffset(gNum);
 		}
 		return OK;
 	}
@@ -325,10 +469,6 @@ private:
 		buf[37] = static_cast<uint8_t>(ie.GetEcoCode() >> 8);
 		buf[38] = ie.GetStoredLineCode();
 		std::copy_n(ie.GetHomePawnData(), 9, buf + 39);
-
-		const uint64_t offset = ie.GetOffset();
-		encode_uint32(buf + 48, pack(offset >> 32, 15, ie.GetLength()));
-		encode_uint32(buf + 52, static_cast<uint32_t>(offset));
 	}
 
 	IndexEntry decodeIndexEntry(const char* data) {
@@ -379,40 +519,7 @@ private:
 		               (static_cast<uint32_t>(data[37]) << 8));
 		res.SetStoredLineCode(data[38]);
 		res.SetHomePawnData(data[39], reinterpret_cast<const byte*>(data + 40));
-
-		val = unpack(decode_uint32(data + 48), 15);
-		res.SetLength(val.second);
-		res.SetOffset((static_cast<uint64_t>(val.first) << 32) |
-		              decode_uint32(data + 52));
-
 		return res;
-	}
-
-	errorT readNamebase(fileModeT fMode, std::string const& filename) {
-		if (auto err = nbfile_.Open(filename.c_str(), fMode))
-			return err;
-
-		if (nbfile_.pubseekpos(0))
-			return ERROR_FileRead;
-
-		idNumberT id[NUM_NAME_TYPES] = {};
-		auto ch = Filebuf::traits_type::eof();
-		while ((ch = nbfile_.sbumpc()) != Filebuf::traits_type::eof()) {
-			char buf[256];
-			if (nbfile_.sgetn(buf, ch + 1) != ch + 1)
-				return ERROR_Corrupt;
-
-			const nameT nt = buf[0];
-			if (nt > NUM_NAME_TYPES)
-				return ERROR_Corrupt;
-
-			nb_->insert(buf + 1, ch, nt, id[nt]++);
-		}
-		for (nameT nt = 0; nt < NUM_NAME_TYPES; ++nt) {
-			if (nb_->getNames()[nt].size() != nb_->GetNumNames(nt))
-				return ERROR_Corrupt;
-		}
-		return OK;
 	}
 
 	inline void encode_uint32(char* dst, uint32_t value) {
@@ -429,5 +536,16 @@ private:
 		       (static_cast<uint32_t>(buf[1]) << 8) |
 		       (static_cast<uint32_t>(buf[2]) << 16) |
 		       (static_cast<uint32_t>(buf[3]) << 24);
+	}
+
+	// Siccome il database è ordinato, e la ricerca posizionale è in ordine
+	// memorizzare la chiave in formato big endian, che rispetta l'ordine
+	// è più veloce
+	inline void encode_uint32_bigendian(char* dst, uint32_t value) {
+		uint8_t* const buf = reinterpret_cast<uint8_t*>(dst);
+		buf[0] = static_cast<uint8_t>(value >> 24);
+		buf[1] = static_cast<uint8_t>(value >> 16);
+		buf[2] = static_cast<uint8_t>(value >> 8);
+		buf[3] = static_cast<uint8_t>(value);
 	}
 };
